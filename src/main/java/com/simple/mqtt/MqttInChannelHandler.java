@@ -5,9 +5,21 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.mqtt.*;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.Promise;
 
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
 public class MqttInChannelHandler extends SimpleChannelInboundHandler<MqttMessage> {
+
+    ThreadPoolExecutor asyncExecutor = new ThreadPoolExecutor(1,1,0, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(20000),new DefaultThreadFactory("消息到达处理线程"),
+            (r, executor) -> {
+                //如果队列满了，直接丢弃
+                System.out.println("积压消息过多，丢弃");
+            });
     private Promise<ConnackRestlt> future;
     private MqttConfig mqttConfig;
     private MqttClient mqttClient;
@@ -108,7 +120,11 @@ public class MqttInChannelHandler extends SimpleChannelInboundHandler<MqttMessag
     private void dealPubrel(ChannelHandlerContext ctx, MqttMessage mqttMessage) {
         final int messageId = ((MqttMessageIdVariableHeader) mqttMessage.variableHeader()).messageId();
         final MqttPublishMessage mqttPublishMessage = mqttClient.getIncomingMessageQos2().get(messageId);
-        dealBrokerMessage(ctx, mqttPublishMessage);
+        if (mqttPublishMessage==null){
+            System.out.println("mqttPublishMessage为空，可能丢失消息messageid："+messageId);
+        }else {
+            dealBrokerMessage(ctx, mqttPublishMessage);
+        }
         //移除messageId的income消息
         mqttClient.getIncomingMessageQos2().remove(messageId);
         //回复comp
@@ -153,13 +169,19 @@ public class MqttInChannelHandler extends SimpleChannelInboundHandler<MqttMessag
 
     private void dealBrokerMessage(ChannelHandlerContext ctx, MqttPublishMessage mqttMessage) {
         final String topicName = mqttMessage.variableHeader().topicName();
-        this.mqttCallback.messageArrived(topicName, mqttMessage);
+        asyncExecutor.execute(()-> this.mqttCallback.messageArrived(topicName, mqttMessage));
+
     }
 
     private void dealPubcomp(ChannelHandlerContext ctx, MqttMessage mqttMessage) {
         final int messageId = ((MqttMessageIdVariableHeader) mqttMessage.variableHeader()).messageId();
         //许诺发送结果
-        mqttClient.getPendingMessageQos2().get(messageId).getFuture().setSuccess(null);
+        final MqttPendingMessage pendingMessage = mqttClient.getPendingMessageQos2().get(messageId);
+        if (pendingMessage == null){
+            System.out.println("重复comple包");
+            return;
+        }
+        pendingMessage.getFuture().setSuccess(null);
         System.out.println("释放messageId:" + messageId);
         //释放messageId
         mqttClient.getPendingMessageIdForQos2().remove(messageId);
@@ -169,6 +191,7 @@ public class MqttInChannelHandler extends SimpleChannelInboundHandler<MqttMessag
         remove.stopPubrelRestransmission();
         //回调
         this.mqttCallback.sendSuccess(remove.message.variableHeader().topicName(), messageId);
+
     }
 
     private void dealPubrec(ChannelHandlerContext ctx, MqttMessage mqttMessage) {
@@ -268,7 +291,6 @@ public class MqttInChannelHandler extends SimpleChannelInboundHandler<MqttMessag
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        System.out.println("捕获异常");
         cause.printStackTrace();
     }
 }
